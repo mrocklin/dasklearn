@@ -53,5 +53,6 @@ def test_pipeline_shares_structure():
     pipeline2 = pipeline2.fit(X, y)
     score2 = pipeline2.score(X, y)
 
-    assert len(merge(score1.dask, score2.dask)) <= len(score1.dask) + 3
+    assert (len(merge(score1.dask, score2.dask))
+         <= (len(score1.dask) + len(score2.dask)) * 0.75)
     assert score1.key != score2.key

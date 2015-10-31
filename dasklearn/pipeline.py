@@ -4,6 +4,7 @@ import sklearn.pipeline
 from toolz import groupby
 
 from dask.imperative import do, value
+from dask.base import normalize_token
 from functools import partial
 do = partial(do, pure=True)
 
@@ -50,7 +51,7 @@ class Pipeline(sklearn.pipeline.Pipeline):
     def predict(self, X):
         for name, est in self.steps[:-1]:
             X = do(transform)(est, X)
-        y = self.steps[-1][1].predict(X)
+        y = self.steps[-1][1].predict(X, pure=True)
         return y
 
     def score(self, X, y):
@@ -73,3 +74,13 @@ class Pipeline(sklearn.pipeline.Pipeline):
         >>> pipeline.to_sklearn().compute()  # doctest: +SKIP
         """
         return do(sklearn.pipeline.Pipeline)(self.steps)
+
+
+@partial(normalize_token.register, sklearn.base.BaseEstimator)
+def normalize_pipeline(est):
+    return type(est), sorted(est.get_params().items())
+
+
+@partial(normalize_token.register, Pipeline)
+def normalize_pipeline(est):
+    return type(est), est.steps
