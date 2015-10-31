@@ -1,13 +1,15 @@
 from .core import fit, transform, predict
 
+from functools import partial
 import time
 import numpy as np
 
 from sklearn.cross_validation import _safe_split, check_scoring, check_cv, indexable
-from sklearn.utils.validation import _num_samples
 from sklearn.base import clone, is_classifier
 from sklearn.grid_search import _CVScoreTuple, _check_param_grid, ParameterGrid
-from dask.imperative import value, compute
+from dask.imperative import value, compute, do
+
+do = partial(do, pure=True)
 
 
 def _fit_and_score(estimator, X, y, scorer, train, test,
@@ -18,8 +20,16 @@ def _fit_and_score(estimator, X, y, scorer, train, test,
 
     start_time = time.time()
 
-    X_train, y_train = _safe_split(estimator, X, y, train)
-    X_test, y_test = _safe_split(estimator, X, y, test, train)
+    X_train = X[train]
+    y_train = y[train]
+    X_test = X[test]
+    y_test = y[test]
+    """
+    xy = do(_safe_split)(estimator, X, y, train)
+    X_train, y_train = xy[0], xy[1]
+    xy = do(_safe_split)(estimator, X, y, test, train)
+    X_test, y_test = xy[0], xy[1]
+    """
 
     if y_train is None:
         estimator = estimator.fit(X_train, **fit_params)
@@ -30,7 +40,7 @@ def _fit_and_score(estimator, X, y, scorer, train, test,
 
     scoring_time = time.time() - start_time
 
-    ret = [test_score, _num_samples(X_test), scoring_time]
+    ret = [test_score, X_test.shape[0], scoring_time]
     if return_parameters:
         ret.append(parameters)
     return ret
@@ -64,12 +74,14 @@ class BaseSearchCV(object):
         cv = check_cv(cv, X, y, classifier=is_classifier(self.estimator))
 
         base_estimator = clone(self.estimator)
+        X, y = value(X), value(y)
         out = [_fit_and_score(base_estimator, X, y, self.scorer_, train,
                               test, parameters, self.fit_params,
                               return_parameters=True)
                for parameters in parameter_iterable
                for train, test in cv]
 
+        # value(out).visualize('dask.pdf')
         out = value(out).compute()
         n_fits = len(out)
         n_folds = len(cv)

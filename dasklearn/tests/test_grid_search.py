@@ -22,7 +22,6 @@ def test_grid_search():
                   'svm__C': np.logspace(-3, 2, 3)}
     grid = dl.GridSearchCV(pipeline, param_grid)
 
-    grid = grid.fit(X_train, y_train)
-    result = grid.score(X_test, y_test)
+    result = grid.fit(X_train, y_train).score(X_test, y_test)
 
     assert isinstance(result, float)
