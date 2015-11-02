@@ -1,4 +1,4 @@
-from .core import fit, transform, predict
+from .core import fit, transform, predict, set_params
 
 from functools import partial
 import time
@@ -7,29 +7,24 @@ import numpy as np
 from sklearn.cross_validation import _safe_split, check_scoring, check_cv, indexable
 from sklearn.base import clone, is_classifier
 from sklearn.grid_search import _CVScoreTuple, _check_param_grid, ParameterGrid
-from dask.imperative import value, compute, do
+
+from dask.imperative import value, compute, do, Value
+from dask.compatibility import apply
+
+from .pipeline import Pipeline
 
 do = partial(do, pure=True)
 
 
 def _fit_and_score(estimator, X, y, scorer, train, test,
-                   parameters, fit_params, return_parameters=False):
-
+                   parameters, fit_params):
     if parameters is not None:
-        estimator = estimator.set_params(**parameters)
-
-    start_time = time.time()
+        estimator = set_params(estimator, **parameters)
 
     X_train = X[train]
     y_train = y[train]
     X_test = X[test]
     y_test = y[test]
-    """
-    xy = do(_safe_split)(estimator, X, y, train)
-    X_train, y_train = xy[0], xy[1]
-    xy = do(_safe_split)(estimator, X, y, test, train)
-    X_test, y_test = xy[0], xy[1]
-    """
 
     if y_train is None:
         estimator = estimator.fit(X_train, **fit_params)
@@ -38,131 +33,78 @@ def _fit_and_score(estimator, X, y, scorer, train, test,
 
     test_score = estimator.score(X_test, y_test)
 
-    scoring_time = time.time() - start_time
-
-    ret = [test_score, X_test.shape[0], scoring_time]
-    if return_parameters:
-        ret.append(parameters)
+    ret = [test_score, X_test.shape[0], parameters]
     return ret
 
 
 class BaseSearchCV(object):
-    def __init__(self, estimator, scoring=None,
-                 fit_params=None, n_jobs=1, iid=True,
-                 refit=True, cv=None, verbose=0, pre_dispatch='2*n_jobs',
-                 error_score='raise'):
+    def __init__(self, estimator, scoring=None, fit_params=None, iid=True,
+            refit=True, cv=None, verbose=0):
 
         self.scoring = scoring
         self.estimator = estimator
-        self.n_jobs = n_jobs
         self.fit_params = fit_params if fit_params is not None else {}
         self.iid = iid
         self.refit = refit
         self.cv = cv
         self.verbose = verbose
-        self.pre_dispatch = pre_dispatch
-        self.error_score = error_score
 
     def _fit(self, X, y, parameter_iterable):
         """Actual fitting,  performing the search over parameters."""
-
-        cv = self.cv
         self.scorer_ = check_scoring(self.estimator, scoring=self.scoring)
-
         X, y = indexable(X, y)
-
-        cv = check_cv(cv, X, y, classifier=is_classifier(self.estimator))
-
+        cv = check_cv(self.cv, X, y, classifier=is_classifier(self.estimator))
         base_estimator = clone(self.estimator)
-        X, y = value(X), value(y)
-        out = [_fit_and_score(base_estimator, X, y, self.scorer_, train,
-                              test, parameters, self.fit_params,
-                              return_parameters=True)
-               for parameters in parameter_iterable
-               for train, test in cv]
 
-        # value(out).visualize('dask.pdf')
-        out = value(out).compute()
-        n_fits = len(out)
-        n_folds = len(cv)
+        best = best_parameters(base_estimator, cv, X, y, parameter_iterable,
+                               self.scorer_, self.fit_params, self.iid)
+        best = best.compute()
 
-        scores = list()
-        grid_scores = list()
-        for grid_start in range(0, n_fits, n_folds):
-            n_test_samples = 0
-            score = 0
-            all_scores = []
-            for this_score, this_n_test_samples, _, parameters in \
-                    out[grid_start:grid_start + n_folds]:
-                all_scores.append(this_score)
-                if self.iid:
-                    this_score *= this_n_test_samples
-                    n_test_samples += this_n_test_samples
-                score += this_score
-            if self.iid:
-                score /= float(n_test_samples)
-            else:
-                score /= float(n_folds)
-            scores.append((score, parameters))
-            # TODO: shall we also store the test_fold_sizes?
-            grid_scores.append(_CVScoreTuple(
-                parameters,
-                score,
-                np.array(all_scores)))
-        # Store the computed scores
-        self.grid_scores_ = grid_scores
-
-        # Find the best parameters by comparing on the mean validation score:
-        # note that `sorted` is deterministic in the way it breaks ties
-        best = sorted(grid_scores, key=lambda x: x.mean_validation_score,
-                      reverse=True)[0]
         self.best_params_ = best.parameters
         self.best_score_ = best.mean_validation_score
+
+
+        if isinstance(base_estimator, Pipeline):
+            base_estimator = base_estimator.to_sklearn().compute()
 
         if self.refit:
             # fit the best estimator using the entire dataset
             # clone first to work around broken estimators
-            best_estimator = clone(base_estimator).set_params(
-                **best.parameters)
+            best_estimator = base_estimator.set_params(**best.parameters)
             if y is not None:
-                best_estimator = best_estimator.fit(X, y, **self.fit_params)
+                self.best_estimator_ = best_estimator.fit(X, y, **self.fit_params)
             else:
-                best_estimator = best_estimator.fit(X, **self.fit_params)
-            self.best_estimator_ = best_estimator
+                self.best_estimator_ = best_estimator.fit(X, **self.fit_params)
         return self
 
     def score(self, X, y=None):
-        """Returns the score on the given data, if the estimator has been refit
+        return self.best_estimator_.score(X, y)
 
-        This uses the score defined by ``scoring`` where provided, and the
-        ``best_estimator_.score`` method otherwise.
 
-        Parameters
-        ----------
-        X : array-like, shape = [n_samples, n_features]
-            Input data, where n_samples is the number of samples and
-            n_features is the number of features.
+def best_parameters(estimator, cv, X, y, parameter_iterable, scorer,
+                    fit_params, iid):
+    """ Lazily apply fit-and-score to data on all parameters / folds
 
-        y : array-like, shape = [n_samples] or [n_samples, n_output], optional
-            Target relative to X for classification or regression;
-            None for unsupervised learning.
+    This function does little of the input checking and it doesn't trigger
+    computation.
 
-        Returns
-        -------
-        score : float
+    Returns a lazy value object.  This should return almost immediately
+    """
+    _X, _y = X, y
+    X = value(X)
+    y = y if y is None else value(y)
+    cv = [(value(train), value(test)) for train, test in cv]
 
-        Notes
-        -----
-         * The long-standing behavior of this method changed in version 0.16.
-         * It no longer uses the metric provided by ``estimator.score`` if the
-           ``scoring`` parameter was set when fitting.
+    out = [_fit_and_score(estimator, X, y, scorer, train,
+                          test, parameters, fit_params)
+           for parameters in parameter_iterable
+           for train, test in cv]
 
-        """
-        return compute(self.best_estimator_.score(X, y))[0]
+    return do(pick_best_parameters)(out, len(cv), iid)
 
 
 class GridSearchCV(BaseSearchCV):
-    """Exhaustive search over specified parameter values for an estimator.
+    """ Exhaustive search over specified parameter values for an estimator.
 
     Important members are fit, predict.
 
@@ -192,26 +134,6 @@ class GridSearchCV(BaseSearchCV):
     fit_params : dict, optional
         Parameters to pass to the fit method.
 
-    n_jobs : int, default 1
-        Number of jobs to run in parallel.
-
-    pre_dispatch : int, or string, optional
-        Controls the number of jobs that get dispatched during parallel
-        execution. Reducing this number can be useful to avoid an
-        explosion of memory consumption when more jobs get dispatched
-        than CPUs can process. This parameter can be:
-
-            - None, in which case all the jobs are immediately
-              created and spawned. Use this for lightweight and
-              fast-running jobs, to avoid delays due to on-demand
-              spawning of the jobs
-
-            - An int, giving the exact number of total jobs that are
-              spawned
-
-            - A string, giving an expression as a function of n_jobs,
-              as in '2*n_jobs'
-
     iid : boolean, default=True
         If True, the data is assumed to be identically distributed across
         the folds, and the loss minimized is the total loss per sample,
@@ -233,13 +155,6 @@ class GridSearchCV(BaseSearchCV):
     verbose : integer
         Controls the verbosity: the higher, the more messages.
 
-    error_score : 'raise' (default) or numeric
-        Value to assign to the score if an error occurs in estimator fitting.
-        If set to 'raise', the error is raised. If a numeric value is given,
-        FitFailedWarning is raised. This parameter does not affect the refit
-        step, which will always raise the error.
-
-
     Examples
     --------
     >>> from sklearn import svm, grid_search, datasets
@@ -249,29 +164,19 @@ class GridSearchCV(BaseSearchCV):
     >>> clf = grid_search.GridSearchCV(svr, parameters)
     >>> clf.fit(iris.data, iris.target)
     ...                             # doctest: +NORMALIZE_WHITESPACE +ELLIPSIS
-    GridSearchCV(cv=None, error_score=...,
+    GridSearchCV(cv=None,
            estimator=SVC(C=1.0, cache_size=..., class_weight=..., coef0=...,
                          decision_function_shape=None, degree=..., gamma=...,
                          kernel='rbf', max_iter=-1, probability=False,
                          random_state=None, shrinking=True, tol=...,
                          verbose=False),
-           fit_params={}, iid=..., n_jobs=1,
-           param_grid=..., pre_dispatch=..., refit=...,
+           fit_params={}, iid=...,
+           param_grid=..., refit=...,
            scoring=..., verbose=...)
 
 
     Attributes
     ----------
-    grid_scores_ : list of named tuples
-        Contains scores for all parameter combinations in param_grid.
-        Each entry corresponds to one parameter setting.
-        Each named tuple has the attributes:
-
-            * ``parameters``, a dict of parameter settings
-            * ``mean_validation_score``, the mean score over the
-              cross-validation folds
-            * ``cv_validation_scores``, the list of scores for each fold
-
     best_estimator_ : estimator
         Estimator that was chosen by the search, i.e. estimator
         which gave highest score (or smallest loss if specified)
@@ -292,14 +197,6 @@ class GridSearchCV(BaseSearchCV):
     The parameters selected are those that maximize the score of the left out
     data, unless an explicit score is passed in which case it is used instead.
 
-    If `n_jobs` was set to a value higher than one, the data is copied for each
-    point in the grid (and not `n_jobs` times). This is done for efficiency
-    reasons if individual jobs take very little time, but may raise errors if
-    the dataset is large and not enough memory is available.  A workaround in
-    this case is to set `pre_dispatch`. Then, the memory is copied only
-    `pre_dispatch` many times. A reasonable value for `pre_dispatch` is `2 *
-    n_jobs`.
-
     See Also
     ---------
     :class:`ParameterGrid`:
@@ -316,12 +213,11 @@ class GridSearchCV(BaseSearchCV):
     """
 
     def __init__(self, estimator, param_grid, scoring=None, fit_params=None,
-                 n_jobs=1, iid=True, refit=True, cv=None, verbose=0,
-                 pre_dispatch='2*n_jobs', error_score='raise'):
+            iid=True, refit=True, cv=None, verbose=0):
 
         super(GridSearchCV, self).__init__(
-            estimator, scoring, fit_params, n_jobs, iid,
-            refit, cv, verbose, pre_dispatch, error_score)
+            estimator, scoring, fit_params, iid,
+            refit, cv, verbose)
         self.param_grid = param_grid
         _check_param_grid(param_grid)
 
@@ -341,3 +237,36 @@ class GridSearchCV(BaseSearchCV):
 
         """
         return self._fit(X, y, ParameterGrid(self.param_grid))
+
+
+def pick_best_parameters(score_len_params, n_folds, iid):
+    n_fits = len(score_len_params)
+
+    scores = list()
+    grid_scores = list()
+    for grid_start in range(0, n_fits, n_folds):
+        n_test_samples = 0
+        score = 0
+        all_scores = []
+        for this_score, this_n_test_samples, parameters in \
+                score_len_params[grid_start:grid_start + n_folds]:
+            all_scores.append(this_score)
+            if iid:
+                this_score *= this_n_test_samples
+                n_test_samples += this_n_test_samples
+            score += this_score
+        if iid:
+            score /= float(n_test_samples)
+        else:
+            score /= float(n_folds)
+        scores.append((score, parameters))
+        grid_scores.append(_CVScoreTuple(
+            parameters,
+            score,
+            np.array(all_scores)))
+
+    # Find the best parameters by comparing on the mean validation score:
+    # note that `sorted` is deterministic in the way it breaks ties
+    best = sorted(grid_scores, key=lambda x: x.mean_validation_score,
+                  reverse=True)[0]
+    return best

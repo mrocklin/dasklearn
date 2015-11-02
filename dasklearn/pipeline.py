@@ -51,7 +51,7 @@ class Pipeline(sklearn.pipeline.Pipeline):
     def predict(self, X):
         for name, est in self.steps[:-1]:
             X = do(transform)(est, X)
-        y = self.steps[-1][1].predict(X, pure=True)
+        y = do(predict)(self.steps[-1][1], X)
         return y
 
     def score(self, X, y):
@@ -64,7 +64,7 @@ class Pipeline(sklearn.pipeline.Pipeline):
         d = groupby(0, [(k.split('__')[0], k.split('__', 1)[1], v)
                         for k, v in params.items()])
         d = {k: {a: b for _, a, b in v} for k, v in d.items()}
-        steps = [(name, do(set_params)(est, **d[name]) if name in d else est)
+        steps = [(name, set_params(est, **d[name]) if name in d else est)
                  for name, est in self.steps]
         return Pipeline(steps)
 
